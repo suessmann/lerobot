@@ -24,7 +24,6 @@ from contextlib import nullcontext
 from copy import copy
 from functools import cache
 
-import rerun as rr
 import torch
 from deepdiff import DeepDiff
 from termcolor import colored
@@ -34,7 +33,6 @@ from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.common.datasets.utils import get_features_from_robot
 from lerobot.common.policies.pretrained import PreTrainedPolicy
 from lerobot.common.robot_devices.robots.utils import Robot
-from lerobot.common.robot_devices.utils import busy_wait
 from lerobot.common.utils.utils import get_safe_torch_device, has_method
 
 
@@ -73,6 +71,10 @@ def log_control_info(robot: Robot, dt_s, episode_index=None, frame_index=None, f
             if key in robot.logs:
                 log_dt("dtRfoll", robot.logs[key])
 
+            key = f"write_follower_{name}_goal_pos"
+            if key in robot.logs:
+                log_dt(f"Pos {name}", robot.logs[key])
+
         for name in robot.cameras:
             key = f"read_camera_{name}_dt_s"
             if key in robot.logs:
@@ -80,6 +82,7 @@ def log_control_info(robot: Robot, dt_s, episode_index=None, frame_index=None, f
 
     info_str = " ".join(log_items)
     logging.info(info_str)
+    # pass
 
 
 @cache
@@ -215,6 +218,7 @@ def control_loop(
     robot,
     control_time_s=None,
     teleoperate=False,
+    mobile=False,
     display_data=False,
     dataset: LeRobotDataset | None = None,
     events=None,
@@ -246,8 +250,11 @@ def control_loop(
     while timestamp < control_time_s:
         start_loop_t = time.perf_counter()
 
-        if teleoperate:
+        if teleoperate and (not mobile):
             observation, action = robot.teleop_step(record_data=True)
+            # pass
+        elif teleoperate and mobile:
+            observation, action = robot.phone_teleop_step(record_data=True)
         else:
             observation = robot.capture_observation()
 

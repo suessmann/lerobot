@@ -26,12 +26,20 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from daxie import VirtualManipulator, get_so100_path
 
 from lerobot.common.robot_devices.cameras.utils import make_cameras_from_configs
 from lerobot.common.robot_devices.motors.utils import MotorsBus, make_motors_buses_from_configs
 from lerobot.common.robot_devices.robots.configs import ManipulatorRobotConfig
 from lerobot.common.robot_devices.robots.utils import get_arm_id
+
+# from lerobot.common.robot_devices.robots.virtual_robot import VirtualManipulator
 from lerobot.common.robot_devices.utils import RobotDeviceAlreadyConnectedError, RobotDeviceNotConnectedError
+
+# URDF_PATH = "/Users/zismanilaaleksnadrovic/robot/SO_5DOF_ARM100_8j/so100.urdf"
+# MESH_PATH = "/Users/zismanilaaleksnadrovic/robot/SO_5DOF_ARM100_8j/meshes/"
+
+URDF_PATH, MESH_PATH = get_so100_path()
 
 
 def ensure_safe_goal_position(
@@ -166,6 +174,9 @@ class ManipulatorRobot:
         self.cameras = make_cameras_from_configs(self.config.cameras)
         self.is_connected = False
         self.logs = {}
+        self.present_pos = None
+
+        self.virtual_robot = VirtualManipulator(URDF_PATH, MESH_PATH)
 
     def get_motor_names(self, arm: dict[str, MotorsBus]) -> list:
         return [f"{arm}_{motor}" for arm, bus in arm.items() for motor in bus.motors]
@@ -439,8 +450,86 @@ class ManipulatorRobot:
             self.follower_arms[name].write("Lock", 0)
             # Set Maximum_Acceleration to 254 to speedup acceleration and deceleration of
             # the motors. Note: this configuration is not in the official STS3215 Memory Table
-            self.follower_arms[name].write("Maximum_Acceleration", 254)
-            self.follower_arms[name].write("Acceleration", 254)
+            self.follower_arms[name].write("Maximum_Acceleration", 64)
+            self.follower_arms[name].write("Acceleration", 64)
+
+    def phone_teleop_step(
+        self, record_data=False
+    ) -> None | tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+        if not self.is_connected:
+            raise RobotDeviceNotConnectedError(
+                "ManipulatorRobot is not connected. You need to run `robot.connect()`."
+            )
+
+        # Send goal position to the follower
+        follower_goal_pos = {}
+        before_lread_t = time.perf_counter()
+        for name in self.follower_arms:
+            # present_pos = self.follower_arms[name].read("Present_Position")
+            # Cap goal position when too far away from present position.
+            # Slower fps expected due to reading from the follower.
+            # if self.config.max_relative_target is not None:
+            if self.present_pos is None:
+                present_pos = self.follower_arms[name].read("Present_Position")
+                self.present_pos = torch.from_numpy(present_pos)
+
+            goal_pos = self.virtual_robot.send_to_robot(self.present_pos)
+            self.present_pos = goal_pos
+            # goal_pos = ensure_safe_goal_position(goal_pos, present_pos, self.config.max_relative_target)
+            before_fwrite_t = time.perf_counter()
+            # Used when record_data=True
+            follower_goal_pos[name] = goal_pos
+            self.logs[f"read_leader_{name}_pos_dt_s"] = time.perf_counter() - before_lread_t
+
+            goal_pos = goal_pos.numpy().astype(np.float32)
+            self.follower_arms[name].write("Goal_Position", goal_pos)
+            self.logs[f"write_follower_{name}_goal_pos_dt_s"] = time.perf_counter() - before_fwrite_t
+            # print(f"NAME: {name}, GOAL: {goal_pos}")
+
+        # Early exit when recording data is not requested
+        if not record_data:
+            return
+
+        # TODO(rcadene): Add velocity and other info
+        # Read follower position
+        follower_pos = {}
+        for name in self.follower_arms:
+            before_fread_t = time.perf_counter()
+            follower_pos[name] = self.follower_arms[name].read("Present_Position")
+            follower_pos[name] = torch.from_numpy(follower_pos[name])
+            self.logs[f"read_follower_{name}_pos_dt_s"] = time.perf_counter() - before_fread_t
+
+        # Create state by concatenating follower current position
+        state = []
+        for name in self.follower_arms:
+            if name in follower_pos:
+                state.append(follower_pos[name])
+        state = torch.cat(state)
+
+        # Create action by concatenating follower goal position
+        action = []
+        for name in self.follower_arms:
+            if name in follower_goal_pos:
+                action.append(follower_goal_pos[name])
+        action = torch.cat(action)
+
+        # Capture images from cameras
+        images = {}
+        for name in self.cameras:
+            before_camread_t = time.perf_counter()
+            images[name] = self.cameras[name].async_read()
+            images[name] = torch.from_numpy(images[name])
+            self.logs[f"read_camera_{name}_dt_s"] = self.cameras[name].logs["delta_timestamp_s"]
+            self.logs[f"async_read_camera_{name}_dt_s"] = time.perf_counter() - before_camread_t
+
+        # Populate output dictionaries
+        obs_dict, action_dict = {}, {}
+        obs_dict["observation.state"] = state
+        action_dict["action"] = action
+        for name in self.cameras:
+            obs_dict[f"observation.images.{name}"] = images[name]
+
+        return obs_dict, action_dict
 
     def teleop_step(
         self, record_data=False
@@ -473,10 +562,12 @@ class ManipulatorRobot:
 
             # Used when record_data=True
             follower_goal_pos[name] = goal_pos
+            self.virtual_robot.render_step(goal_pos)
 
             goal_pos = goal_pos.numpy().astype(np.float32)
             self.follower_arms[name].write("Goal_Position", goal_pos)
             self.logs[f"write_follower_{name}_goal_pos_dt_s"] = time.perf_counter() - before_fwrite_t
+            # print(f"NAME: {name}, GOAL: {goal_pos}")
 
         # Early exit when recording data is not requested
         if not record_data:

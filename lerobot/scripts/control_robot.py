@@ -237,6 +237,7 @@ def teleoperate(robot: Robot, cfg: TeleoperateControlConfig):
         control_time_s=cfg.teleop_time_s,
         fps=cfg.fps,
         teleoperate=True,
+        mobile=cfg.mobile,
         display_data=cfg.display_data,
     )
 
